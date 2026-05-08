@@ -3,7 +3,7 @@
 教育自治体ビジネス情報収集スクリプト
 - RSS / HTMLスクレイピング / 検索ベースで新着記事を収集
 - 重複排除 (state.json)
-- Anthropic APIで要約 + カテゴリ自動分類
+- Anthropic APIで要約 + カテゴリ自動分類 (★並列化済み)
 - 成果物: data/articles_YYYYMMDD.json (本日新着), data/all_articles.json (全履歴)
 """
 import os
@@ -12,6 +12,9 @@ import json
 import hashlib
 import re
 import time
+import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -25,16 +28,35 @@ from dateutil import parser as date_parser
 # ---- 設定 ----
 ROOT = Path(__file__).resolve().parent.parent
 SOURCES_FILE = ROOT / "sources.yaml"
-STATE_FILE = ROOT / "state" / "seen.json"
+STATE_DIR = ROOT / "state"
+STATE_FILE = STATE_DIR / "seen.json"
+ENRICH_CACHE_FILE = STATE_DIR / "enrich_cache.json"
 DATA_DIR = ROOT / "data"
 DATA_DIR.mkdir(exist_ok=True)
-(ROOT / "state").mkdir(exist_ok=True)
+STATE_DIR.mkdir(exist_ok=True)
 
 USER_AGENT = "Mozilla/5.0 (compatible; EduIntelBot/1.0; +https://example.com)"
 HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "ja"}
 REQ_TIMEOUT = 20
-MAX_PER_SOURCE = 30  # 1ソースから取る上限
-RECENT_DAYS = 7      # この日数以内の記事のみ対象
+MAX_PER_SOURCE = 30          # 1ソースから取る上限
+RECENT_DAYS = 7              # この日数以内の記事のみ対象
+
+# ★並列実行数（ワークフロー側の env で上書き可）
+ENRICH_CONCURRENCY = int(os.environ.get("ENRICH_CONCURRENCY", "8"))
+# ★Claude API リトライ（429/529 等の一時エラー対策）
+ANTHROPIC_MAX_RETRIES = 4
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+# ★中間保存の頻度（N件ごとに partial をディスクへ）
+CHECKPOINT_EVERY = 20
+
+# 並列処理時のロギング/カウンタ用ロック
+_print_lock = threading.Lock()
+_progress_counter = {"done": 0, "total": 0}
+
+
+def log(msg):
+    with _print_lock:
+        print(msg, flush=True)
 
 
 def load_sources():
@@ -54,13 +76,43 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+def load_enrich_cache():
+    """前回 enrich 済みの結果を id でキー保存。失敗時の再実行を高速化"""
+    if ENRICH_CACHE_FILE.exists():
+        try:
+            with open(ENRICH_CACHE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def save_enrich_cache(cache):
+    # 件数が増えすぎないよう 90 日以内のみ残す
+    cutoff = datetime.now() - timedelta(days=90)
+    pruned = {}
+    for k, v in cache.items():
+        ts = v.get("fetched_at")
+        if not ts:
+            pruned[k] = v
+            continue
+        try:
+            dt = date_parser.parse(ts)
+            dt_naive = dt.replace(tzinfo=None) if dt.tzinfo else dt
+            if dt_naive > cutoff:
+                pruned[k] = v
+        except Exception:
+            pruned[k] = v
+    with open(ENRICH_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(pruned, f, ensure_ascii=False, indent=2)
+
+
 def article_id(url):
     """URLからユニークID生成"""
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
 
 
 def parse_date(s):
-    """日付文字列を datetime に変換 (失敗したらNone)"""
     if not s:
         return None
     try:
@@ -71,7 +123,7 @@ def parse_date(s):
 
 def is_recent(dt, days=RECENT_DAYS):
     if not dt:
-        return True  # 日付不明は採用
+        return True
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=None)
     else:
@@ -81,11 +133,11 @@ def is_recent(dt, days=RECENT_DAYS):
 
 # ---- RSS収集 ----
 def fetch_rss(source):
-    print(f"[RSS] {source['name']}: {source['url']}")
+    log(f"[RSS] {source['name']}: {source['url']}")
     try:
         feed = feedparser.parse(source["url"], request_headers=HEADERS)
     except Exception as e:
-        print(f"  ERROR: {e}")
+        log(f"  ERROR: {e}")
         return []
     out = []
     for entry in feed.entries[:MAX_PER_SOURCE]:
@@ -113,13 +165,13 @@ def fetch_rss(source):
 
 # ---- HTMLスクレイピング ----
 def fetch_html_listing(source):
-    print(f"[HTML] {source['name']}: {source['url']}")
+    log(f"[HTML] {source['name']}: {source['url']}")
     try:
         r = requests.get(source["url"], headers=HEADERS, timeout=REQ_TIMEOUT)
         r.raise_for_status()
         r.encoding = r.apparent_encoding or "utf-8"
     except Exception as e:
-        print(f"  ERROR: {e}")
+        log(f"  ERROR: {e}")
         return []
     soup = BeautifulSoup(r.text, "html.parser")
     selector = source.get("selector", "a")
@@ -134,7 +186,6 @@ def fetch_html_listing(source):
         full_url = urljoin(base_url, href)
         if base_filter and base_filter not in full_url:
             continue
-        # PDFやアーカイブ系は教育情報なのでOKだが、内部の上下ナビは除外
         title = a.get_text(strip=True)
         if not title or len(title) < 5:
             continue
@@ -146,7 +197,7 @@ def fetch_html_listing(source):
             "url": full_url,
             "title": title,
             "raw_summary": "",
-            "published_at": None,  # 後で取得試行
+            "published_at": None,
             "source_id": source["id"],
             "source_name": source["name"],
             "default_category": source.get("default_category", "general"),
@@ -156,18 +207,14 @@ def fetch_html_listing(source):
     return out
 
 
-# ---- 検索ベース収集 (Tavily / Brave / 代替) ----
+# ---- 検索ベース収集 (Tavily / Brave) ----
 def fetch_search(source):
-    """
-    Tavily APIまたはBrave Search APIを使った検索ベースの新着発見。
-    環境変数 TAVILY_API_KEY または BRAVE_API_KEY が必要。
-    """
-    print(f"[SEARCH] {source['name']}")
+    log(f"[SEARCH] {source['name']}")
     out = []
     tavily_key = os.environ.get("TAVILY_API_KEY")
     brave_key = os.environ.get("BRAVE_API_KEY")
     if not (tavily_key or brave_key):
-        print("  検索APIキー未設定 - スキップ")
+        log("  検索APIキー未設定 - スキップ")
         return out
     for q in source.get("queries", []):
         try:
@@ -176,7 +223,7 @@ def fetch_search(source):
             else:
                 results = brave_search(q, brave_key)
         except Exception as e:
-            print(f"  search error: {e}")
+            log(f"  search error: {e}")
             continue
         for r in results[:5]:
             url = r.get("url", "")
@@ -238,7 +285,6 @@ def fetch_article_body(url, max_chars=4000):
     soup = BeautifulSoup(r.text, "html.parser")
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
-    # 本文抽出 (article, main, または #main)
     main = soup.find("article") or soup.find("main") or soup.find(id="main") or soup.body
     if not main:
         return ""
@@ -246,17 +292,50 @@ def fetch_article_body(url, max_chars=4000):
     return text[:max_chars]
 
 
-# ---- Claude APIによる要約 + カテゴリ分類 ----
+# ---- Claude APIによる要約 + カテゴリ分類 (リトライ付き) ----
+def _call_anthropic(prompt, api_key):
+    """Anthropic /messages を叩く。429/529/接続エラーは指数バックオフでリトライ"""
+    last_err = None
+    for attempt in range(ANTHROPIC_MAX_RETRIES):
+        try:
+            r = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": ANTHROPIC_MODEL,
+                    "max_tokens": 400,
+                    "messages": [{"role": "user", "content": prompt}],
+                },
+                timeout=45,
+            )
+            if r.status_code in (429, 529, 500, 502, 503, 504):
+                # サーバ側の一時エラー → リトライ
+                wait = (2 ** attempt) + random.random()
+                log(f"  Anthropic {r.status_code}: retrying in {wait:.1f}s (attempt {attempt + 1})")
+                time.sleep(wait)
+                last_err = f"HTTP {r.status_code}"
+                continue
+            r.raise_for_status()
+            return r.json()["content"][0]["text"].strip()
+        except (requests.ConnectionError, requests.Timeout) as e:
+            wait = (2 ** attempt) + random.random()
+            log(f"  Anthropic conn err: {e} retrying in {wait:.1f}s")
+            time.sleep(wait)
+            last_err = str(e)
+    raise RuntimeError(f"Anthropic API failed after {ANTHROPIC_MAX_RETRIES} attempts: {last_err}")
+
+
 def summarize_with_claude(article, body):
-    """
-    Anthropic API経由で2-3行要約とカテゴリ判定を取得
-    """
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        # APIキー未設定時はrule-basedのみ
         article["summary"] = (article.get("raw_summary") or article["title"])[:200]
         article["category"] = classify_by_keyword(article, body)
         article["importance"] = score_importance(article, body)
+        article["tags"] = []
         return article
 
     prompt = f"""以下は教育向け自治体ビジネスのリサーチ情報です。営業担当者向けに重要なポイントを抽出してください。
@@ -274,23 +353,7 @@ def summarize_with_claude(article, body):
 }}"""
 
     try:
-        r = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 400,
-                "messages": [{"role": "user", "content": prompt}],
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        text = r.json()["content"][0]["text"].strip()
-        # JSONブロック抽出
+        text = _call_anthropic(prompt, api_key)
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if m:
             data = json.loads(m.group(0))
@@ -304,7 +367,7 @@ def summarize_with_claude(article, body):
             article["importance"] = 3
             article["tags"] = []
     except Exception as e:
-        print(f"  Claude API error: {e}")
+        log(f"  Claude API error (fallback): {e}")
         article["summary"] = (article.get("raw_summary") or article["title"])[:200]
         article["category"] = classify_by_keyword(article, body)
         article["importance"] = score_importance(article, body)
@@ -313,7 +376,6 @@ def summarize_with_claude(article, body):
 
 
 def classify_by_keyword(article, body):
-    """フォールバック分類: キーワードマッチでカテゴリ決定"""
     text = (article.get("title", "") + " " + body[:1000])
     sources = load_sources()
     rules = sources.get("classification_keywords", {})
@@ -322,14 +384,13 @@ def classify_by_keyword(article, body):
         for kw in kws:
             if kw in text:
                 scores[cat] += 1
-    best = max(scores.items(), key=lambda x: x[1])
+    best = max(scores.items(), key=lambda x: x[1]) if scores else (article.get("default_category", "general"), 0)
     if best[1] > 0:
         return best[0]
     return article.get("default_category", "general")
 
 
 def score_importance(article, body):
-    """ヒューリスティック重要度スコア"""
     score = 3
     text = article.get("title", "") + body[:1000]
     if any(kw in text for kw in ["文部科学省", "文科省", "通知", "ガイドライン"]):
@@ -341,11 +402,50 @@ def score_importance(article, body):
     return min(5, score)
 
 
+# ---- 1記事の enrich ワーカー (本文取得 + Claude要約) ----
+def enrich_one(article, cache):
+    """単一記事の本文取得 + Claude要約。cache hit ならスキップ"""
+    aid = article["id"]
+    if aid in cache:
+        # キャッシュビ���ト: 既存結果を流用
+        cached = cache[aid]
+        article.update({
+            "summary": cached.get("summary", article.get("title", ""))[:200],
+            "category": cached.get("category", article.get("default_category", "general")),
+            "importance": cached.get("importance", 3),
+            "tags": cached.get("tags", []),
+            "fetched_at": cached.get("fetched_at", datetime.now().isoformat()),
+        })
+        with _print_lock:
+            _progress_counter["done"] += 1
+            log(f"[{_progress_counter['done']}/{_progress_counter['total']}] cached: {article['title'][:50]}")
+        return article
+
+    body = fetch_article_body(article["url"])
+    article = summarize_with_claude(article, body)
+    article["fetched_at"] = datetime.now().isoformat()
+
+    # キャッシュに書き込み（並列なのでロック）
+    with _print_lock:
+        cache[aid] = {
+            "summary": article.get("summary"),
+            "category": article.get("category"),
+            "importance": article.get("importance"),
+            "tags": article.get("tags"),
+            "fetched_at": article["fetched_at"],
+        }
+        _progress_counter["done"] += 1
+        log(f"[{_progress_counter['done']}/{_progress_counter['total']}] enriched: {article['title'][:50]}")
+    return article
+
+
 # ---- メイン ----
 def run():
-    print(f"=== 教育自治体情報収集 開始 {datetime.now().isoformat()} ===")
+    log(f"=== 教育自治体情報収集 開始 {datetime.now().isoformat()} ===")
+    log(f"  並列度: {ENRICH_CONCURRENCY}, モデル: {ANTHROPIC_MODEL}")
     sources = load_sources()
     state = load_state()
+    enrich_cache = load_enrich_cache()
     seen_ids = set(state.get("seen_ids", []))
 
     candidates = []
@@ -361,10 +461,10 @@ def run():
                 items = fetch_search(src)
             else:
                 continue
-            print(f"  -> {len(items)} items")
+            log(f"  -> {len(items)} items")
             candidates.extend(items)
         except Exception as e:
-            print(f"  source error: {e}")
+            log(f"  source error: {e}")
 
     # URL重複排除
     by_id = {}
@@ -374,17 +474,40 @@ def run():
         if item["id"] not in by_id:
             by_id[item["id"]] = item
     new_articles = list(by_id.values())
-    print(f"\n本日の新着: {len(new_articles)}件 (重複排除後)")
+    log(f"\n本日の新着: {len(new_articles)}件 (重複排除後)")
 
-    # 各記事の本文取得 + 要約 + カテゴリ分類
+    # ★並列 enrich
+    _progress_counter["total"] = len(new_articles)
+    _progress_counter["done"] = 0
     enriched = []
-    for i, art in enumerate(new_articles, 1):
-        print(f"[{i}/{len(new_articles)}] enriching: {art['title'][:50]}")
-        body = fetch_article_body(art["url"])
-        art = summarize_with_claude(art, body)
-        art["fetched_at"] = datetime.now().isoformat()
-        enriched.append(art)
-        time.sleep(0.5)  # レート制限対策
+    checkpoint_path = DATA_DIR / "_partial.json"
+
+    if new_articles:
+        with ThreadPoolExecutor(max_workers=ENRICH_CONCURRENCY) as executor:
+            future_to_art = {
+                executor.submit(enrich_one, art, enrich_cache): art for art in new_articles
+            }
+            for future in as_completed(future_to_art):
+                try:
+                    result = future.result()
+                    enriched.append(result)
+                except Exception as e:
+                    art = future_to_art[future]
+                    log(f"  enrich failed for {art.get('url')}: {e}")
+                    art["summary"] = (art.get("raw_summary") or art.get("title", ""))[:200]
+                    art["category"] = art.get("default_category", "general")
+                    art["importance"] = 3
+                    art["tags"] = []
+                    art["fetched_at"] = datetime.now().isoformat()
+                    enriched.append(art)
+                # 中間保存
+                if len(enriched) % CHECKPOINT_EVERY == 0:
+                    try:
+                        with open(checkpoint_path, "w", encoding="utf-8") as f:
+                            json.dump(enriched, f, ensure_ascii=False, indent=2)
+                        save_enrich_cache(enrich_cache)
+                    except Exception as e:
+                        log(f"  checkpoint save error: {e}")
 
     # 重要度でソート
     enriched.sort(key=lambda x: (-x.get("importance", 3), x.get("published_at") or ""))
@@ -394,7 +517,14 @@ def run():
     today_file = DATA_DIR / f"articles_{today}.json"
     with open(today_file, "w", encoding="utf-8") as f:
         json.dump(enriched, f, ensure_ascii=False, indent=2)
-    print(f"本日分: {today_file}")
+    log(f"本日分: {today_file}")
+
+    # 中間ファイルは削除
+    if checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+        except Exception:
+            pass
 
     # 全履歴更新
     all_file = DATA_DIR / "all_articles.json"
@@ -404,7 +534,6 @@ def run():
     else:
         all_articles = []
     all_articles = enriched + all_articles
-    # 90日分のみ保持
     cutoff = datetime.now() - timedelta(days=90)
 
     def _within_cutoff(a):
@@ -420,15 +549,15 @@ def run():
     all_articles = [a for a in all_articles if _within_cutoff(a)]
     with open(all_file, "w", encoding="utf-8") as f:
         json.dump(all_articles, f, ensure_ascii=False, indent=2)
-    print(f"全履歴: {all_file} ({len(all_articles)}件)")
+    log(f"全履歴: {all_file} ({len(all_articles)}件)")
 
-    # state更新
+    # state 更新
     seen_ids.update(a["id"] for a in enriched)
-    # 90日以上前のIDは消す (sizeが大きくなりすぎないように)
     state["seen_ids"] = list(seen_ids)[-5000:]
     state["last_run"] = datetime.now().isoformat()
     save_state(state)
-    print("=== 完了 ===")
+    save_enrich_cache(enrich_cache)
+    log("=== 完了 ===")
     return enriched
 
 
