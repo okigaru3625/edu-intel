@@ -6,9 +6,16 @@ on:
     - cron: '0 0 * * 1-5'
   workflow_dispatch: {}  # 手動実行も可能
 
+# 同じ日内の二重実行を防止（手動 + cron が重なるケース対策）
+concurrency:
+  group: edu-intel-daily
+  cancel-in-progress: false
+
 jobs:
   collect-and-send:
     runs-on: ubuntu-latest
+    # ジョブ全体のタイムアウト（並列化により通常 10 分程度で完了）
+    timeout-minutes: 30
     permissions:
       contents: write   # data/ と site/ の更新コミットのため
       pages: write      # GitHub Pagesデプロイ
@@ -26,10 +33,13 @@ jobs:
       - name: 依存ライブラリインストール
         run: pip install -r requirements.txt
 
-      - name: 情報収集 + 要約 (Claude API使用)
+      - name: 情報収集 + 要約 (Claude API使用、並列実行)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          # ★並列度（Anthropic Tier 2以上なら 8〜12 が安全圏）
+          ENRICH_CONCURRENCY: '8'
+          ANTHROPIC_MODEL: 'claude-haiku-4-5-20251001'
         run: python scripts/collect.py
 
       - name: まとめサイト生成
