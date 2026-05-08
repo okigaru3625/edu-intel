@@ -1,0 +1,189 @@
+# 教育自治体ビジネス向け情報収集ソース定義
+# カテゴリ: giga / komuDX / security / case / mext / general
+# type: rss / html / search
+
+sources:
+  # ============ RSS フィード (確実に取れるソース) ============
+  - id: ict_enews
+    name: ICT教育ニュース
+    type: rss
+    url: https://ict-enews.net/feed/
+    default_category: general
+    enabled: true
+
+  - id: resemom_it
+    name: リセマム 教育ICT
+    type: rss
+    url: https://resemom.jp/category/it-education/feed/
+    default_category: general
+    enabled: true
+
+  - id: reseed
+    name: リシード (ReseEd)
+    type: rss
+    url: https://reseed.resemom.jp/feed/
+    default_category: general
+    enabled: true
+
+  - id: kodomo_to_it
+    name: こどもとIT (Impress)
+    type: rss
+    url: https://edu.watch.impress.co.jp/data/rss/1.0/cdt/feed.rdf
+    default_category: general
+    enabled: true
+
+  - id: kknews
+    name: 教育家庭新聞
+    type: rss
+    url: https://www.kknews.co.jp/feed
+    fallback_html: https://www.kknews.co.jp/news
+    default_category: general
+    enabled: true
+
+  - id: kyoiku_press
+    name: 日本教育新聞 ICT特集
+    type: rss
+    url: https://www.kyoiku-press.com/feed/
+    default_category: general
+    enabled: true
+
+  # ============ HTML スクレイピング (RSSなし) ============
+  - id: mext_news
+    name: 文部科学省 新着情報
+    type: html
+    url: https://www.mext.go.jp/b_menu/news/index.html
+    selector: "ul.news-list li a, div.news-content a"
+    default_category: mext
+    enabled: true
+
+  - id: mext_jogai_news
+    name: 文部科学省 初中局情報教育課
+    type: html
+    url: https://www.mext.go.jp/a_menu/shotou/zyouhou/index.htm
+    selector: "a"
+    base_filter: "/a_menu/shotou/zyouhou/"
+    default_category: giga
+    enabled: true
+
+  - id: mext_houdou
+    name: 文部科学省 報道発表
+    type: html
+    url: https://www.mext.go.jp/b_menu/houdou/2026/index.html
+    selector: "ul li a"
+    default_category: mext
+    enabled: true
+
+  - id: studx_style
+    name: StuDX Style (校務DX事例)
+    type: html
+    url: https://www.mext.go.jp/studxstyle/
+    selector: "article a, .post-list a"
+    default_category: komuDX
+    enabled: true
+
+  # ============ 検索ベース (新着自治体導入事例の発見) ============
+  - id: search_giga_local
+    name: 自治体GIGA端末導入 (検索)
+    type: search
+    queries:
+      - "GIGAスクール 端末更新 自治体 導入 採用"
+      - "教育委員会 1人1台 端末 共同調達"
+      - "次世代校務 共同調達 自治体"
+    default_category: case
+    enabled: true
+
+  - id: search_zerotrust
+    name: 教育ゼロトラスト導入 (検索)
+    type: search
+    queries:
+      - "教育委員会 ゼロトラスト 導入"
+      - "学校 ネットワーク 統合 ゼロトラスト 自治体"
+      - "教育情報セキュリティ ガイドライン 自治体"
+    default_category: security
+    enabled: true
+
+  - id: search_komu_dx
+    name: 校務DX事例 (検索)
+    type: search
+    queries:
+      - "校務支援システム 共同調達 自治体"
+      - "校務DX クラウド 教育委員会 導入"
+      - "次世代校務DX環境 自治体"
+    default_category: komuDX
+    enabled: true
+
+  - id: search_bidding
+    name: 自治体入札 教育系 (検索)
+    type: search
+    queries:
+      - "教育委員会 入札公告 ICT"
+      - "学校 端末 一般競争入札 教育"
+      - "校務支援 プロポーザル 自治体"
+    default_category: case
+    enabled: true
+
+# ============ カテゴリ定義 ============
+categories:
+  giga:
+    label: GIGAスクール
+    color: "#3b82f6"
+    icon: "🎒"
+  komuDX:
+    label: 校務DX
+    color: "#10b981"
+    icon: "📋"
+  security:
+    label: セキュリティ・ゼロトラスト
+    color: "#ef4444"
+    icon: "🔒"
+  case:
+    label: 自治体導入事例
+    color: "#8b5cf6"
+    icon: "🏛️"
+  mext:
+    label: 文科省・通知
+    color: "#f59e0b"
+    icon: "📜"
+  general:
+    label: その他
+    color: "#6b7280"
+    icon: "📰"
+
+# ============ キーワード分類ルール (記事内容で自動カテゴリ判定) ============
+classification_keywords:
+  giga:
+    - GIGAスクール
+    - 1人1台
+    - 端末更新
+    - NEXT GIGA
+    - ICT環境整備
+    - StuDX
+  komuDX:
+    - 校務DX
+    - 校務支援システム
+    - 校務クラウド
+    - 教職員 働き方
+    - ロケーションフリー
+    - 次世代校務
+  security:
+    - ゼロトラスト
+    - 教育情報セキュリティ
+    - セキュリティポリシー
+    - アクセス制御
+    - 不正アクセス
+    - ランサム
+  case:
+    - 採用
+    - 導入
+    - 共同調達
+    - 入札
+    - 契約
+    - 選定
+    - プロポーザル
+  mext:
+    - 文部科学省
+    - 文科省
+    - 通知
+    - ガイドライン
+    - 概算要求
+    - 答申
