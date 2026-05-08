@@ -406,10 +406,18 @@ def run():
     all_articles = enriched + all_articles
     # 90日分のみ保持
     cutoff = datetime.now() - timedelta(days=90)
-    all_articles = [
-        a for a in all_articles
-        if not a.get("fetched_at") or parse_date(a["fetched_at"]) > cutoff.replace(tzinfo=None) if parse_date(a["fetched_at"]) else True
-    ]
+
+    def _within_cutoff(a):
+        fetched = a.get("fetched_at")
+        if not fetched:
+            return True
+        dt = parse_date(fetched)
+        if dt is None:
+            return True
+        dt_naive = dt.replace(tzinfo=None) if dt.tzinfo else dt
+        return dt_naive > cutoff
+
+    all_articles = [a for a in all_articles if _within_cutoff(a)]
     with open(all_file, "w", encoding="utf-8") as f:
         json.dump(all_articles, f, ensure_ascii=False, indent=2)
     print(f"全履歴: {all_file} ({len(all_articles)}件)")
