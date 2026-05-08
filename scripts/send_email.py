@@ -170,7 +170,8 @@ def send_smtp(html_body, text_body, subject):
             s.starttls(context=ctx)
             s.login(user, password)
             s.send_message(msg)
-    print(f"送信完了: {to_list}")
+    # 注意: 公開リポジトリのActionsログには配信先メールアドレスを出さない
+    print(f"送信完了: {len(to_list)}件の宛先に配信")
 
 
 def main():
